@@ -1,0 +1,655 @@
+---
+title: "Predictive Analysis on the Wages of Professional Soccer Players"
+author: "Jaejin Kim"
+date: "1/18/2019"
+output: pdf_document
+---
+
+```{r setup, message=FALSE}
+library(foreign)
+library(cluster)
+library(NbClust)
+library(klaR)
+library(ggdendro)
+library(GGally)
+library(e1071)
+library(caret)
+library(knitr)
+library(gridExtra)
+library(foreign)
+library(ggplot2)
+library(reshape2)
+library(randomForest)
+library(NeuralNetTools)
+library(dbarts)
+```
+
+#DATA SOURCE AND MEASUREMENT SCALES
+
+Data analytics is being used more and more in sports by teams to gain any marginal advantage over their opponents. Teams with limited resources need to be able to indentify key needs and more importantly make sure they get good value for money. We have FIFA 19 data, containing information on over 18,000 real-life soccer players and ratings of their physical and playing attributes. Using these attribute ratings, we will try to predict player wages. Each of these attributes are on a scale from 0 - 100 with a player receiving a score for each attribute. This should help us answer the question of whether players are over or under paid based solely on their playing ability. With this analysis, teams will be able to make informed decisions.
+
+##DATA PREPARATION AND TRANSFORMATIONS
+
+We start by loading in the data and removing the columns that we will not be using. 
+
+```{r}
+data <- read.csv("../Data/data.csv")
+data <- data[,-c(1,2,5,7,11,14,17,18,19,20,21,23,29:54,89)]
+```
+
+There are some missing values in the data so we decide to remove these players as there is no data on them.
+
+```{r}
+data <- na.omit(data)
+```
+
+We must adjust the Wage and Value columns into numerics. Previously they have currency symbols and 'K' to indicate thousands and 'M' to indicate millions. By removing them, we can then treat this data as numbers and not characters. This makes the data easier to work with later on.
+
+```{r}
+data$Wage <- gsub("\u20AC","",data$Wage)
+data$Wage <- gsub("K","e3",data$Wage)
+data$Wage <- as.numeric(data$Wage)
+
+data$Value <- gsub("\u20AC","",data$Value)
+data$Value <- gsub("K","e3",data$Value)
+data$Value <- gsub("M",'e6',data$Value)
+data$Value <- as.numeric(data$Value)
+
+data <- subset(data,data$Wage != 0)
+```
+
+We also remove players with wage of 0 since most of these are free agents who do not play for a team. This would likely affect our results if we used them and make it difficult to classify wages so we choose to ignore them. 
+
+```{r}
+table(data$Position)
+```
+
+While there are a number of positions that players can play, we want to group these players into broader categories. We create 4 groups of players, Goalkeepers, Defenders, Midfielders and Attackers. We will examine these groups individually as we do not think it makes much sense to compare goalkeepers to attackers for example. Wages and attributes vary dramatically between these groups but hopefully the differences in attributes of players within the same groups will help predict their wages. 
+
+```{r}
+data$LogWage <- log(data$Wage)
+data[17:50] <- sapply(data[17:50],as.numeric)
+
+GK <- subset(data,data$Position == "GK")
+D <- subset(data,data$Position == "CB" | data$Position == "LB" | data$Position == "LCB" |
+              data$Position == "LWB" | data$Position == "RB" | data$Position == "RCB" |
+              data$Position == "RWB")
+M <- subset(data,data$Position == "CAM" | data$Position == "CDM" |
+              data$Position == "CM" | data$Position == "LAM" | data$Position == "LCM" |
+              data$Position == "LDM" | data$Position == "LM" | data$Position == "RAM" |
+              data$Position == "RCB" | data$Position == "RCM" | data$Position == "RDM" |
+              data$Position == "RM")
+A <- subset(data,data$Position == "CF" | data$Position == "LF" | data$Position == "LS" |
+              data$Position == "LW" | data$Position == "RF" | data$Position == "RS" |
+              data$Position == "RW" | data$Position == "ST")
+```
+
+Additionally, we took the log of wage to help address the skew we see in our sample for each group.
+
+```{r}
+par(mfrow=c(1,2))
+#Density wages for each group
+plot(density(GK$Wage), col="orange", main="Density of Wage by position")
+lines(density(D$Wage), col="blue")
+lines(density(M$Wage), col="green")
+lines(density(A$Wage), col="red")
+legend("topright", legend = c("GK","D","M","A"), col = c("orange","blue","green","red"), lty = "solid")
+
+#Density log wages for each group
+plot(density(GK$LogWage), col="orange", main="Density of LogWage by position")
+lines(density(D$LogWage), col="blue")
+lines(density(M$LogWage), col="green")
+lines(density(A$LogWage), col="red")
+legend("topright", legend = c("GK","D","M","A"), col = c("orange","blue","green","red"), lty = "solid")
+```
+
+In our initial dataset, we have around 35 attributes which each player is graded on. There are 5 attributes that are designed specifically for goalkeeping attributes. We want to examine if there is any correlation between these attributes. 
+
+```{r, fig.width=5, fig.height=4}
+melted_cormat.GK <- melt(round(cor(GK[,46:50]),2))
+melted_cormat.D <- melt(round(cor(D[,17:45]),2))
+melted_cormat.M <- melt(round(cor(M[,17:45]),2))
+melted_cormat.A <- melt(round(cor(A[,17:45]),2))
+
+ggplot(data = melted_cormat.GK, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.D, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.M, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.A, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+rm(melted_cormat.GK)
+rm(melted_cormat.D)
+rm(melted_cormat.M)
+rm(melted_cormat.A)
+```
+
+Unsurprisingly there are a number of features that correlate with each other. For example, Ball control and Short passing are highly correlated. Since we also have a fairly large dataset, it makes sense for us to do some engineering on our features. We create 6 new features that will consolidate attributes that are likely to be correlated with each other. These new features are Shooting, Passing, Dribbling, Defending, Physical and Pace.
+
+```{r}
+data$Shooting <- rowMeans(data[c("Finishing","Volleys","ShotPower","LongShots",
+                                 "HeadingAccuracy","Curve","FKAccuracy",
+                                 "Penalties","Composure")])
+data$Passing <- rowMeans(data[c("Crossing","ShortPassing","LongPassing",
+                                "Vision")])
+data$Dribbling <- rowMeans(data[c("Dribbling","BallControl")])
+data$Defending <- rowMeans(data[c("StandingTackle","SlidingTackle","Marking",
+                                  "Interceptions","Positioning")])
+data$Physical <- rowMeans(data[c("Reactions","Balance","Jumping","Stamina",
+                                 "Strength","Aggression")])
+data$Pace <- rowMeans(data[c("Acceleration","SprintSpeed","Agility")])
+```
+
+```{r}
+GK <- subset(data,data$Position == "GK")
+D <- subset(data,data$Position == "CB" | data$Position == "LB" | data$Position == "LCB" |
+              data$Position == "LWB" | data$Position == "RB" | data$Position == "RCB" |
+              data$Position == "RWB")
+M <- subset(data,data$Position == "CAM" | data$Position == "CDM" |
+              data$Position == "CM" | data$Position == "LAM" | data$Position == "LCM" |
+              data$Position == "LDM" | data$Position == "LM" | data$Position == "RAM" |
+              data$Position == "RCB" | data$Position == "RCM" | data$Position == "RDM" |
+              data$Position == "RM")
+A <- subset(data,data$Position == "CF" | data$Position == "LF" | data$Position == "LS" |
+              data$Position == "LW" | data$Position == "RF" | data$Position == "RS" |
+              data$Position == "RW" | data$Position == "ST")
+```
+
+We also want to see if there are still high correlations between these new features for each group of player.
+
+```{r, fig.width=5, fig.height=4}
+melted_cormat.GK <- melt(round(cor(GK[,46:50]),2))
+melted_cormat.D <- melt(round(cor(D[,52:56]),2))
+melted_cormat.M <- melt(round(cor(M[,52:56]),2))
+melted_cormat.A <- melt(round(cor(A[,52:56]),2))
+
+ggplot(data = melted_cormat.GK, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.D, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.M, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+ggplot(data = melted_cormat.A, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient('performance', limits=c(-1, 1),
+                      breaks = c(-1, -0.5, 0, 0.5, 1),  low = "white", high = "red")
+
+rm(melted_cormat.GK)
+rm(melted_cormat.D)
+rm(melted_cormat.M)
+rm(melted_cormat.A)
+```
+
+We find that while there is still some correlation, it is greatly reduced. Since Goalkeepers only have 5 attributes, we cannot do much feature engineering on them. 
+
+```{r}
+cutGK2 <- round(c(999, 2000, 260001), 1)
+cutD2 <- round(c(999, 3000, 380001), 1)
+cutM2 <- round(c(999, 3000, 420001), 1)
+cutA2 <- round(c(999, 4000, 565001), 1)
+
+GK$Wagecode2 <- cut(GK$Wage, breaks=cutGK2, labels=c("Low", "High"))
+D$Wagecode2 <- cut(D$Wage, breaks=cutD2, labels=c("Low", "High"))
+M$Wagecode2 <- cut(M$Wage, breaks=cutM2, labels=c("Low", "High"))
+A$Wagecode2 <- cut(A$Wage, breaks=cutA2, labels=c("Low", "High"))
+
+rm(cutGK2)
+rm(cutD2)
+rm(cutM2)
+rm(cutA2)
+```
+
+We also want to create two groups of players and assign them as low and high wage players. This will be helpful later on for splitting the data into train and test splits. 
+
+#ANALYSIS PLAN
+We will compare a number of different approaches in our analysis. Our initial plan is to create baseline linear models and compare these results to SVM and Random Forest. We expect that since this is a regression problem, Random Forests will not perform as well as the linear models. SVM may be able to perform well assuming we use the kernel trick appropriately. 
+
+#LINEAR REGRESSION
+As our baseline, we will try to run a linear regression to predict Log wages based on the physical attributes of the players. We include the specific position they play as a factor variable. We also include age and international reputation, as we expect these variables to be relevant. 
+```{r}
+LMD <- lm(LogWage~factor(Position)+Age+Crossing+Finishing+HeadingAccuracy+ShortPassing
+          +Volleys+Dribbling+Curve+FKAccuracy+LongPassing+BallControl+Acceleration
+          +SprintSpeed+Agility+Reactions+Balance+ShotPower+Jumping+Stamina+Strength
+          +LongShots+Aggression+Interceptions+Positioning+Vision+Penalties+Composure
+          +Marking+StandingTackle+SlidingTackle+International.Reputation,data=D)
+summaryLMD <- summary(LMD)
+summaryLMD$r.squared
+summaryLMD$adj.r.squared
+rm(LMD)
+rm(summaryLMD)
+```
+
+```{r}
+LMM <- lm(LogWage~factor(Position)+Age+Crossing+Finishing+HeadingAccuracy+ShortPassing
+          +Volleys+Dribbling+Curve+FKAccuracy+LongPassing+BallControl+Acceleration
+          +SprintSpeed+Agility+Reactions+Balance+ShotPower+Jumping+Stamina+Strength
+          +LongShots+Aggression+Interceptions+Positioning+Vision+Penalties+Composure
+          +Marking+StandingTackle+SlidingTackle+International.Reputation,data=M)
+summaryLMM <- summary(LMM)
+summaryLMM$r.squared
+summaryLMM$adj.r.squared
+rm(LMM)
+rm(summaryLMM)
+```
+
+```{r}
+LMA <- lm(LogWage~factor(Position)+Age+Crossing+Finishing+HeadingAccuracy+ShortPassing
+          +Volleys+Dribbling+Curve+FKAccuracy+LongPassing+BallControl+Acceleration
+          +SprintSpeed+Agility+Reactions+Balance+ShotPower+Jumping+Stamina+Strength
+          +LongShots+Aggression+Interceptions+Positioning+Vision+Penalties+Composure
+          +Marking+StandingTackle+SlidingTackle+International.Reputation,data=A)
+summaryLMA <- summary(LMA)
+summaryLMA$r.squared
+summaryLMA$adj.r.squared
+rm(LMA)
+rm(summaryLMA)
+```
+
+
+For the Goalkeepers, we look at a much smaller group of attributes to determine their wages. This is because the attributes that pertain to goalkeepers is a smaller set.
+
+```{r}
+LMGK <- lm(LogWage~Age+GKDiving+GKHandling+GKKicking+GKPositioning+GKReflexes
+           +International.Reputation,data=GK)
+summaryLMGK <- summary(LMGK)
+summaryLMGK$r.squared
+summaryLMGK$adj.r.squared
+rm(LMGK)
+rm(summaryLMGK)
+```
+
+We choose to look at the R-squared and adjusted R-squared in order to evaluate these regression models. The R-squared for each group is somewhat similar but we find that the Goalkeepers models perform the best (0.683, meaning that 68.3% of the variation we see in LogWage is explained by the selected physical attributes) and the Midfielders model worst (0.627). One concern we had that with such a large number of features, this may negatively effect the adjusted R-squared for each model. However we find that the adjusted R-squared is only slightly lower than the R-squared. 
+
+Since we cannot use such a high number of for our other methods, we also choose to look at our generated features to see how a linear model would perform with fewer features. 
+
+```{r}
+LMGK <- lm(LogWage~Age+GKDiving+GKHandling+GKKicking+GKPositioning+GKReflexes,data=GK)
+summaryLMGK <- summary(LMGK)
+summaryLMGK$r.squared
+summaryLMGK$adj.r.squared
+rm(LMGK)
+rm(summaryLMGK)
+```
+
+```{r}
+LMD <- lm(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling
+          +factor(Position),data=D)
+summaryLMD <- summary(LMD)
+summaryLMD$r.squared
+summaryLMD$adj.r.squared
+rm(LMD)
+rm(summaryLMD)
+```
+
+```{r}
+LMM <- lm(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling
+          +factor(Position),data=M)
+summaryLMM <- summary(LMM)
+summaryLMM$r.squared
+summaryLMM$adj.r.squared
+rm(LMM)
+rm(summaryLMM)
+```
+
+```{r}
+LMA <- lm(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling
+          +factor(Position),data=A)
+summaryLMA <- summary(LMA)
+summaryLMA$r.squared
+summaryLMA$adj.r.squared
+rm(LMA)
+rm(summaryLMA)
+```
+
+We find that the R-squared and adjusted R-Squared actually fell when using our features. While the change is not dramatic, we would still recommend using the model with the entire set of features. 
+
+#SVM
+Now, we split our data into 70% training and 30% test data sets to prepare for our next approaches. The first of these is SVM with cross validation. 
+
+```{r}
+TC <- trainControl(method = "repeatedcv",number = 10,repeats = 20)
+
+set.seed(2011)
+GK.inTrain <- createDataPartition(y = GK$Wagecode2, p = 0.7, list = FALSE)
+D.inTrain <- createDataPartition(y = D$Wagecode2, p = 0.7, list = FALSE)
+M.inTrain <- createDataPartition(y = M$Wagecode2, p = 0.7, list = FALSE)
+A.inTrain <- createDataPartition(y = A$Wagecode2, p = 0.7, list = FALSE)
+
+GK.training <- GK[GK.inTrain,]
+D.training <- D[D.inTrain,]
+M.training <- M[M.inTrain,]
+A.training <- A[A.inTrain,]
+
+GK.testing <- GK[-GK.inTrain,]
+D.testing <- D[-D.inTrain,]
+M.testing <- M[-M.inTrain,]
+A.testing <- A[-A.inTrain,]
+
+rm(GK.inTrain)
+rm(D.inTrain)
+rm(M.inTrain)
+rm(A.inTrain)
+```
+
+```{r}
+GK.svm <- train(LogWage~Age+GKDiving+GKHandling+GKKicking+GKPositioning+GKReflexes,
+                data = GK.training, method = "svmRadial",trControl = TC)
+svm.pred <- predict(GK.svm,GK.testing)
+print(GK.svm,showSD = T)
+#xtabs(~svm.pred+GK.testing$Wagecode2)
+cor(svm.pred,GK.testing$LogWage)
+rm(GK.svm)
+rm(svm.pred)
+```
+
+```{r}
+D.svm <- train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+               data = D.training, method = "svmRadial",trControl = TC)
+svm.pred <- predict(D.svm,D.testing)
+print(D.svm,showSD = T)
+#xtabs(~svm.pred+D.testing$Wagecode2)
+cor(svm.pred,D.testing$LogWage)
+rm(D.svm)
+rm(svm.pred)
+```
+
+```{r}
+M.svm <- train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+               data = M.training, method = "svmRadial",trControl = TC)
+svm.pred <- predict(M.svm,M.testing)
+print(M.svm,showSD = T)
+#xtabs(~svm.pred+M.testing$Wagecode2)
+cor(svm.pred,M.testing$LogWage)
+rm(M.svm)
+rm(svm.pred)
+```
+
+```{r}
+A.svm <- train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+               data = A.training, method = "svmRadial",trControl = TC)
+svm.pred <- predict(A.svm,A.testing)
+print(A.svm,showSD = T)
+#xtabs(~svm.pred+A.testing$Wagecode2)
+cor(svm.pred,A.testing$LogWage)
+rm(A.svm)
+rm(svm.pred)
+```
+
+We observe that the Defenders, Midfielders and Attackers return an RMSE in the range 0.7-0.74. Goalkeepers are lower at approximately 0.64. Goalkeepers therefore have a higher R-squared than the other positions, at 0.71 vs. approximately 0.66.
+
+We see that our SVM predictions have a correlation of approximately 0.8 with LogWage across all groups. In line with our earlier results, this is strongest for GKs at 0.832. It is weakest for Defenders at 0.801.
+
+#RANDOM FOREST
+
+We now run random forest predictions on each grouping. We run this with 1000 trees on our training data.
+
+```{r}
+TC <- trainControl(method = "cv", number = 10, search = "grid")
+```
+
+```{r}
+GK.rf <- caret::train(LogWage~Age+GKDiving+GKHandling+GKKicking+GKPositioning+GKReflexes,
+                      data = GK.training, method = "rf",trControl = TC, ntree = 1000,
+                      importance=TRUE)
+rf.pred <- predict(GK.rf,GK.testing)
+print(GK.rf)
+
+rm(GK.rf)
+rm(rf.pred)
+```
+
+```{r}
+D.rf <- caret::train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                     data = D.training, method = "rf",trControl = TC, ntree = 1000,
+                     importance=TRUE)
+rf.pred <- predict(D.rf,D.testing)
+print(D.rf)
+
+rm(D.rf)
+rm(rf.pred)
+```
+
+```{r}
+M.rf <- caret::train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                     data = M.training, method = "rf",trControl = TC, ntree = 1000,
+                     importance=TRUE)
+rf.pred <- predict(M.rf,M.testing)
+print(M.rf)
+
+rm(M.rf)
+rm(rf.pred)
+```
+
+```{r}
+A.rf <- caret::train(LogWage~Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                     data = A.training, method = "rf",trControl = TC, ntree = 1000,
+                     importance=TRUE)
+rf.pred <- predict(A.rf,A.testing)
+print(A.rf)
+
+rm(A.rf)
+rm(rf.pred)
+rm(TC)
+```
+
+Our optimal models for each group return similar RMSE and R-squared results for random forest as they did for SVM. We see that the Defenders, Midfielders and Attackers return RMSEs in the range 0.71-0.74 with R-squareds between 0.62-0.68. Again, our peformance for GKs is slightly better, with a RMSE of 0.63 and an R-squared of 0.71 in the optimal model.
+
+#NEURAL NETS
+
+```{r}
+TC <- trainControl(method = "cv", number = 10, search = "grid")
+
+GK.nnet <- train(LogWage ~ Age + GKDiving + GKHandling + GKKicking + GKPositioning 
+                 + GKReflexes, data = GK.training, method = "nnet", metric = "RMSE",
+                 trControl = TC, importance = TRUE, linout = 1, trace = FALSE)
+pred.GK.nnet <- predict(GK.nnet, GK.testing)
+par(mar=numeric(4),family='serif')
+plotnet(GK.nnet$finalModel, cex_val=.5)
+
+D.nnet <- train(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = D.training, method = "nnet", metric = "RMSE", trControl = TC,
+                importance=TRUE, linout = 1, trace = FALSE)
+pred.D.nnet <- predict(D.nnet, D.testing)
+par(mar=numeric(4),family='serif')
+plotnet(D.nnet$finalModel, cex_val=.5)
+
+M.nnet <- train(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = M.training, method = "nnet", metric = "RMSE", trControl = TC,
+                importance=TRUE, linout = 1, trace = FALSE)
+pred.M.nnet <- predict(M.nnet, M.testing)
+par(mar=numeric(4),family='serif')
+plotnet(M.nnet$finalModel, cex_val=.5)
+
+A.nnet <- train(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = A.training, method = "nnet", metric = "RMSE", trControl = TC,
+                importance=TRUE, linout = 1, trace = FALSE)
+pred.A.nnet <- predict(A.nnet, A.testing)
+par(mar=numeric(4),family='serif')
+plotnet(A.nnet$finalModel, cex_val=.5)
+
+rm(GK.nnet)
+rm(pred.GK.nnet)
+rm(D.nnet)
+rm(pred.D.nnet)
+rm(M.nnet)
+rm(pred.M.nnet)
+rm(A.nnet)
+rm(pred.A.nnet)
+```
+
+For GKs, this graph shows that neural nets analysis is not appropriate, giving us only a single connecting node. For the other 3 groups, we see that each of our inputs are approximately balanced, with none weighing much more heavily than the others. However these plots still indicate that a linear regression model may be most appropriate.
+
+
+
+#BART
+
+Finally, we run Bayesian Additive Regression Trees (BART) on our data. 
+
+```{r}
+pdbart.wrapper <- function(bartfit,data,...){
+  form <- as.formula(paste0("~-1+",paste0(bartfit$call$formula[c(2,3)],collapse="+")))
+  mm <- model.matrix(form,data)
+  pdbart(x.train=mm[,-1],y.train=mm[,1],...)
+}
+```
+
+```{r}
+GK.bart <- bart2(LogWage ~ Age + GKDiving + GKHandling + GKKicking + GKPositioning
+                 + GKReflexes,data = GK.training,keepTrees = TRUE)
+GK.bart.pred <- predict(GK.bart,GK.testing)
+GK.bart.pred2 <- GK.bart.pred[2,]
+
+cor(GK.bart.pred2[1,],GK.testing$LogWage)
+cor(GK.bart.pred2[2,],GK.testing$LogWage)
+cor(GK.bart.pred2[3,],GK.testing$LogWage)
+cor(GK.bart.pred2[4,],GK.testing$LogWage)
+
+#RMSE
+error <- GK.bart.pred2[1,] - GK.testing$LogWage
+sqrt(mean(error^2))
+error <- GK.bart.pred2[2,] - GK.testing$LogWage
+sqrt(mean(error^2))
+error <- GK.bart.pred2[3,] - GK.testing$LogWage
+sqrt(mean(error^2))
+error <- GK.bart.pred2[4,] - GK.testing$LogWage
+sqrt(mean(error^2))
+
+par(mfrow=c(2,3),oma=c(0,1,0,1))
+pdbart.run <- pdbart.wrapper(GK.bart,data=GK.training)
+
+rm(GK.bart)
+rm(GK.bart.pred)
+rm(GK.bart.pred2)
+rm(error)
+rm(pdbart.run)
+```
+
+```{r}
+D.bart <- bart2(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = D.training,keepTrees = TRUE)
+D.bart.pred <- predict(D.bart,D.testing)
+D.bart.pred2 <- D.bart.pred[2,]
+
+cor(D.bart.pred2[1,],D.testing$LogWage)
+cor(D.bart.pred2[2,],D.testing$LogWage)
+cor(D.bart.pred2[3,],D.testing$LogWage)
+cor(D.bart.pred2[4,],D.testing$LogWage)
+
+#RMSE
+error <- D.bart.pred2[1,] - D.testing$LogWage
+sqrt(mean(error^2))
+error <- D.bart.pred2[2,] - D.testing$LogWage
+sqrt(mean(error^2))
+error <- D.bart.pred2[3,] - D.testing$LogWage
+sqrt(mean(error^2))
+error <- D.bart.pred2[4,] - D.testing$LogWage
+sqrt(mean(error^2))
+
+par(mfrow=c(2,3),oma=c(0,1,0,1))
+pdbart.run <- pdbart.wrapper(D.bart,data=D.training)
+
+rm(D.bart)
+rm(D.bart.pred)
+rm(D.bart.pred2)
+rm(error)
+rm(pdbart.run)
+```
+
+```{r}
+M.bart <- bart2(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = M.training,keepTrees = TRUE)
+M.bart.pred <- predict(M.bart,M.testing)
+M.bart.pred2 <- M.bart.pred[2,]
+
+cor(M.bart.pred2[1,],M.testing$LogWage)
+cor(M.bart.pred2[2,],M.testing$LogWage)
+cor(M.bart.pred2[3,],M.testing$LogWage)
+cor(M.bart.pred2[4,],M.testing$LogWage)
+
+#RMSE
+error <- M.bart.pred2[1,] - M.testing$LogWage
+sqrt(mean(error^2))
+error <- M.bart.pred2[2,] - M.testing$LogWage
+sqrt(mean(error^2))
+error <- M.bart.pred2[3,] - M.testing$LogWage
+sqrt(mean(error^2))
+error <- M.bart.pred2[4,] - M.testing$LogWage
+sqrt(mean(error^2))
+
+par(mfrow=c(2,3),oma=c(0,1,0,1))
+pdbart.run <- pdbart.wrapper(M.bart,data=M.training)
+
+rm(M.bart)
+rm(M.bart.pred)
+rm(M.bart.pred2)
+rm(error)
+rm(pdbart.run)
+```
+
+```{r}
+A.bart <- bart2(LogWage ~ Age+Shooting+Passing+Defending+Physical+Pace+Dribbling,
+                data = A.training,keepTrees = TRUE)
+A.bart.pred <- predict(A.bart,A.testing)
+A.bart.pred2 <- A.bart.pred[2,]
+
+cor(A.bart.pred2[1,],A.testing$LogWage)
+cor(A.bart.pred2[2,],A.testing$LogWage)
+cor(A.bart.pred2[3,],A.testing$LogWage)
+cor(A.bart.pred2[4,],A.testing$LogWage)
+
+#RMSE
+error <- A.bart.pred2[1,] - A.testing$LogWage
+sqrt(mean(error^2))
+error <- A.bart.pred2[2,] - A.testing$LogWage
+sqrt(mean(error^2))
+error <- A.bart.pred2[3,] - A.testing$LogWage
+sqrt(mean(error^2))
+error <- A.bart.pred2[4,] - A.testing$LogWage
+sqrt(mean(error^2))
+
+par(mfrow=c(2,3),oma=c(0,1,0,1))
+pdbart.run <- pdbart.wrapper(A.bart,data=A.training)
+
+rm(A.bart)
+rm(A.bart.pred)
+rm(A.bart.pred2)
+rm(error)
+rm(pdbart.run)
+```
+
+In these outputs, we find further evidence that that this problem should be solved using linear regression. Using the BART output, we plot marginal plots for each position and attribute. The more these look like straight lines, the more it's simply a linear model. While there are some exceptions, such as age for goalkeepers, most of these features do look linear. This also might help explain why each of our methods yeilded similar results. 
+
+#Conclusion
+
+In trying to find the best model to predict player wages, we find that this is truly a linear regression problem. A simple additive linear model seems to do as well as any other method in explaining how wages change with changes in player skill level. Using this model, we will be able to predict a new players wage given their attributes. If we also take existing players and find their wage using the model, we may be able to show whether that player is underpaid or overpaid for their skill level. 
+
